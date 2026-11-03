@@ -445,7 +445,16 @@ def render(name, **ctx):
 # Routes
 # --------------------------------------------------------------------------
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+import shutil
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "assets")
+os.makedirs(STATIC_DIR, exist_ok=True)
+for _src in (os.path.join(BASE_DIR, "logo.png"), os.path.join(BASE_DIR, "static", "logo.png")):
+    if os.path.isfile(_src):  # logo may sit in the repo root or in static/
+        shutil.copyfile(_src, os.path.join(STATIC_DIR, "logo.png"))
+        break
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/healthz")
