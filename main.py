@@ -127,6 +127,9 @@ class Proxy:
         self.proc = None
         self.last = {}
         self.active_ids = None
+        self.error = ""
+        self.raw = ""
+        self._last_log = 0
 
     def _active(self):
         return [u for u in all_users() if u["state"] == "active"]
@@ -144,6 +147,7 @@ class Proxy:
             'METRICS_LISTEN_ADDR_IPV4 = "127.0.0.1"\n'
             'METRICS_WHITELIST = ["127.0.0.1"]\n'
             'METRICS_PREFIX = "mtproxy_"\n'
+            'METRICS_SCRAPE_PATH = "/metrics"\n'
             "METRICS_EXPORT_LINKS = False\n"
         )
         with open(os.path.join(PROXY_DIR, "config.py"), "w") as f:
@@ -173,16 +177,41 @@ class Proxy:
         self.start()
 
     def _scrape(self):
-        url = f"http://127.0.0.1:{METRICS_PORT}/"
-        text = urllib.request.urlopen(url, timeout=3).read().decode()
+        """Read per-user byte counters from the proxy's metrics endpoint."""
+        last_err = None
+        text = None
+        for path in ("/metrics", "/"):
+            try:
+                url = f"http://127.0.0.1:{METRICS_PORT}{path}"
+                text = urllib.request.urlopen(url, timeout=3).read().decode()
+                break
+            except Exception as e:
+                last_err = e
+        if text is None:
+            raise last_err
+        self.raw = text
         data = {}
         pat = re.compile(
-            r'^mtproxy_user_octets_(from|to)_client\{user="u(\d+)"\}\s+([0-9.eE+-]+)', re.M
+            r'^\S*user_octets_(from|to)_client\{user="u(\d+)"\}\s+([0-9.eE+-]+)', re.M
         )
         for direction, uid, val in pat.findall(text):
             row = data.setdefault(int(uid), [0, 0])
             row[0 if direction == "from" else 1] = int(float(val))
         return data
+
+    def _account(self, data):
+        for uid, (a, b) in data.items():
+            la, lb = self.last.get(uid, (0, 0))
+            delta = (a - la if a >= la else a) + (b - lb if b >= lb else b)
+            if delta > 0:
+                q("UPDATE users SET used = used + ? WHERE id = ?", (delta, uid), write=True)
+            self.last[uid] = (a, b)
+
+    def _fail(self, msg):
+        self.error = msg
+        if now() - self._last_log > 60:  # do not spam the log
+            self._last_log = now()
+            print(f"[siwan] metrics error: {msg}", flush=True)
 
     def tick(self):
         if self.proc is None or self.proc.poll() is not None:
@@ -190,15 +219,16 @@ class Proxy:
             return
         try:
             data = self._scrape()
-        except Exception:
+            self.error = ""
+        except Exception as e:
+            self._fail(repr(e))
             return
-        for uid, (a, b) in data.items():
-            la, lb = self.last.get(uid, (0, 0))
-            delta = (a - la if a >= la else a) + (b - lb if b >= lb else b)
-            if delta > 0:
-                q("UPDATE users SET used = used + ? WHERE id = ?", (delta, uid), write=True)
-            self.last[uid] = (a, b)
+        self._account(data)
         if {u["id"] for u in self._active()} != self.active_ids:
+            try:  # count the last bytes before the restart wipes the counters
+                self._account(self._scrape())
+            except Exception:
+                pass
             self.restart()
 
 
@@ -503,6 +533,21 @@ def admin(request: Request):
     users = all_users()
     links = {u["id"]: proxy_link(u, request) for u in users}
     return render("admin", users=users, links=links, base=base_url(request), proxy_host=bool(PROXY_HOST))
+
+
+@app.get("/admin/debug")
+def admin_debug(request: Request):
+    if not authed(request):
+        return RedirectResponse("/login", status_code=303)
+    return JSONResponse(
+        {
+            "proxy_running": bool(PROXY.proc and PROXY.proc.poll() is None),
+            "active_user_ids": sorted(PROXY.active_ids or []),
+            "last_error": PROXY.error,
+            "counters": {str(k): v for k, v in PROXY.last.items()},
+            "raw_metrics_head": PROXY.raw[:1500],
+        }
+    )
 
 
 def _gb(value: str):
